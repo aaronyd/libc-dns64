@@ -1,0 +1,168 @@
+--- ecdysis-bind-9.7.2-P2D20101117/bin/named/query.c	2010-12-01 19:16:07.000000000 +0200
++++ query.c	2011-03-23 15:04:32.000000000 +0200
+@@ -63,6 +63,11 @@
+ #include <named/sortlist.h>
+ #include <named/xfrout.h>
+ 
++/* EDNS0 SY bits*/
++#define SY0  0x8000
++#define SY1  0x4000
++#define SY2  0x2000
++
+ /*% Partial answer? */
+ #define PARTIALANSWER(c)	(((c)->query.attributes & \
+ 				  NS_QUERYATTR_PARTIALANSWER) != 0)
+@@ -125,6 +130,9 @@
+ 	dns_rdataset_t *rdataset;
+ } client_additionalctx_t;
+ 
++
++void dns64_flag(unsigned int pre64_len, isc_uint16_t *flag);
++
+ static isc_result_t
+ query_find(ns_client_t *client, dns_fetchevent_t *event, dns_rdatatype_t qtype);
+ 
+@@ -158,6 +166,129 @@
+ 	}
+ }
+ 
++
++void dns64_flag(unsigned int pre64_len, isc_uint16_t *flag)
++{
++  *flag=0;
++  switch (pre64_len)
++  {
++    case 32:
++      *flag |= SY2;
++      break;
++
++    case 40:
++      *flag |= SY1;
++      break;
++
++    case 48:
++      *flag |= (SY1|SY2);
++      break;
++
++    case 56:
++      *flag |= SY0;
++      break;
++
++    case 64:
++      *flag |= (SY0|SY2);
++      break;
++
++    case 96:
++      *flag |= (SY0|SY1);
++      break;
++
++    default:
++      *flag = 0;
++  }
++}
++
++
++static isc_result_t 
++add_dns64_opt(ns_client_t *client)
++{
++  isc_uint16_t flag = 0;
++  dns_rdata_t *rdata = NULL;
++  dns_rdatalist_t *rdatalist = NULL;
++  dns_rdataset_t *rdataset = NULL;
++  isc_result_t result;
++  isc_uint16_t udpsize;
++  dns_view_t *view;
++  dns_resolver_t *resolver;
++
++  result = dns_message_gettemprdata(client->message, &rdata);
++  if (result != ISC_R_SUCCESS)
++    return (result);
++
++  result = dns_message_gettemprdatalist(client->message, &rdatalist);
++  if (result != ISC_R_SUCCESS)
++    return (result);
++
++  result = dns_message_gettemprdataset(client->message, &rdataset);
++  if (result != ISC_R_SUCCESS)
++    return (result);
++
++  dns_rdataset_init(rdataset);
++
++  rdatalist->type = dns_rdatatype_opt;
++  rdatalist->covers = 0;
++
++  view = client->view;
++  resolver = (view != NULL) ? view->resolver : NULL;
++  if (resolver != NULL)
++    udpsize = dns_resolver_getudpsize(resolver);
++  else
++    udpsize = ns_g_udpsize;
++  rdatalist->rdclass = udpsize;
++
++  rdatalist->ttl = (client->extflags & DNS_MESSAGEEXTFLAG_REPLYPRESERVE);
++
++  dns64_flag(view->dns64_prefixlen, &flag);
++
++// EDNS0 SY bits, 4B header + 2B data
++
++  if(flag>0)
++  {
++    unsigned char optdata[6];
++    isc_buffer_t *buf = NULL;
++
++    result = isc_buffer_allocate(client->mctx, &buf, sizeof(optdata));
++    if(result != ISC_R_SUCCESS)
++      goto no_bits;
++
++    isc_buffer_putuint16(buf, 5); // opt code
++    isc_buffer_putuint16(buf, 2); // opt length
++    isc_buffer_putuint16(buf, flag);
++    rdata->data = buf->base;
++    dns_message_takebuffer(client->message, &buf);
++
++    rdata->length = sizeof(optdata);
++  }
++  else 
++  {
++no_bits:
++    rdata->data = NULL;
++    rdata->length = 0;
++  }
++
++  rdata->rdclass = rdatalist->rdclass;
++  rdata->type = rdatalist->type;
++  rdata->flags = 0;
++
++  ISC_LIST_INIT(rdatalist->rdata);
++  ISC_LIST_APPEND(rdatalist->rdata, rdata, link);
++  RUNTIME_CHECK(dns_rdatalist_tordataset(rdatalist, rdataset)== ISC_R_SUCCESS);
++
++  if(client->opt != NULL)
++  {
++    if (dns_rdataset_isassociated(client->opt))
++      dns_rdataset_disassociate(client->opt);
++    dns_message_puttemprdataset(client->message, &(client->opt));
++  }
++
++  client->opt = rdataset;
++  return (ISC_R_SUCCESS);
++}
++
++
+ static void
+ query_send(ns_client_t *client) {
+ 	isc_statscounter_t counter;
+@@ -5519,6 +5650,13 @@
+ 	 */
+ 	if (client->query.restarts > 0 && qtype == dns_rdatatype_a) {
+ 		result = query_dns64_synth_aaaa(client);
++
++         // append EDNS0 opt
++                if( result == ISC_R_SUCCESS)
++                { 
++                  if ((client->opt) != NULL)
++                    result = add_dns64_opt(client);
++                }
+ 		if (result != ISC_R_SUCCESS)
+ 			QUERY_ERROR(DNS_R_SERVFAIL);
+ 	}
